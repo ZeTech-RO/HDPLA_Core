@@ -1,0 +1,54 @@
+-- Player Count Reporter Script
+-- Place this script in ServerScriptService of each target place
+-- Reports player count to DataStore for the main menu server browser
+
+local Players = game:GetService("Players")
+local DataStoreService = game:GetService("DataStoreService")
+
+-- DataStore for tracking player counts
+local playerCountStore = DataStoreService:GetDataStore("ServerBrowserPlayerCounts")
+
+local placeId = game.PlaceId
+
+-- Update player count in DataStore
+local function updatePlayerCount()
+	local currentPlayers = #Players:GetPlayers()
+	
+	local success, result = pcall(function()
+		playerCountStore:SetAsync("Place_" .. tostring(placeId), {
+			currentPlayers = currentPlayers,
+			lastUpdated = os.time()
+		})
+	end)
+	
+	if success then
+		print("Updated player count for place", placeId, ":", currentPlayers)
+	else
+		warn("Failed to update player count:", result)
+	end
+end
+
+-- Update on player join
+Players.PlayerAdded:Connect(function(player)
+	task.wait(1) -- Small delay to ensure player is fully loaded
+	updatePlayerCount()
+end)
+
+-- Update on player leave
+Players.PlayerRemoving:Connect(function(player)
+	task.wait(1) -- Small delay
+	updatePlayerCount()
+end)
+
+-- Periodic update every 30 seconds
+task.spawn(function()
+	while true do
+		updatePlayerCount()
+		task.wait(30)
+	end
+end)
+
+-- Initial update
+updatePlayerCount()
+
+print("Player Count Reporter loaded for place:", placeId)
