@@ -1,1 +1,281 @@
+-- Server Browser Server Script
+-- Handles admin verification, teleportation, shutdown commands, and player count tracking
 
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local MessagingService = game:GetService("MessagingService")
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Require configuration
+local Config = require(ReplicatedStorage:WaitForChild("ServerBrowserConfig"))
+
+-- DataStore for tracking player counts across places
+local playerCountStore = DataStoreService:GetDataStore("ServerBrowserPlayerCounts")
+
+-- DataStore for custom permissions set by admins (per PlaceId)
+local customPermissionStore = DataStoreService:GetDataStore("ServerBrowserCustomPerms")
+
+-- Create RemoteEvents for client-server communication
+local remoteFolder = Instance.new("Folder")
+remoteFolder.Name = "ServerBrowserRemotes"
+remoteFolder.Parent = ReplicatedStorage
+
+local teleportEvent = Instance.new("RemoteEvent")
+teleportEvent.Name = "TeleportToPlace"
+teleportEvent.Parent = remoteFolder
+
+local shutdownEvent = Instance.new("RemoteEvent")
+shutdownEvent.Name = "ShutdownServer"
+shutdownEvent.Parent = remoteFolder
+
+local checkAdminEvent = Instance.new("RemoteFunction")
+checkAdminEvent.Name = "CheckAdmin"
+checkAdminEvent.Parent = remoteFolder
+
+local getPlacesEvent = Instance.new("RemoteFunction")
+getPlacesEvent.Name = "GetPlaces"
+getPlacesEvent.Parent = remoteFolder
+
+local checkJoinPermissionFunc = Instance.new("RemoteFunction")
+checkJoinPermissionFunc.Name = "CheckJoinPermission"
+checkJoinPermissionFunc.Parent = remoteFolder
+
+local setCustomPermissionEvent = Instance.new("RemoteEvent")
+setCustomPermissionEvent.Name = "SetCustomPermission"
+setCustomPermissionEvent.Parent = remoteFolder
+
+local getCustomPermissionFunc = Instance.new("RemoteFunction")
+getCustomPermissionFunc.Name = "GetCustomPermission"
+getCustomPermissionFunc.Parent = remoteFolder
+
+-- Helper: read custom permission from DataStore for a PlaceId
+local function getCustomPermissionForPlace(placeId)
+	local key = "Perm_" .. tostring(placeId)
+	local success, data = pcall(function()
+		return customPermissionStore:GetAsync(key)
+	end)
+	if success and data then
+		return data
+	end
+	return nil
+end
+
+-- Helper: write custom permission to DataStore for a PlaceId
+local function setCustomPermissionForPlace(placeId, permissionData)
+	local key = "Perm_" .. tostring(placeId)
+	local success, result = pcall(function()
+		customPermissionStore:SetAsync(key, permissionData)
+	end)
+	return success
+end
+
+-- Handle teleportation requests
+teleportEvent.OnServerEvent:Connect(function(player, placeId)
+	-- Validate the place ID exists in our config
+	local targetPlace = nil
+	for _, place in ipairs(Config.Places) do
+		if place.PlaceId == placeId then
+			targetPlace = place
+			break
+		end
+	end
+	
+	if not targetPlace then
+		warn("Invalid place ID requested by", player.Name)
+		return
+	end
+	
+	-- Check custom permission first, then fall back to server type default
+	local customPerm = getCustomPermissionForPlace(placeId)
+	local canJoin, reason = Config.CanJoinWithCustomPermission(player, customPerm, targetPlace.Type)
+	if not canJoin then
+		warn("Join denied for", player.Name, "to", targetPlace.Type, ":", reason)
+		return
+	end
+	
+	-- Teleport the player
+	local success, result = pcall(function()
+		TeleportService:Teleport(placeId, player)
+	end)
+	
+	if not success then
+		warn("Failed to teleport", player.Name, "to place", placeId, ":", result)
+	end
+end)
+
+-- Handle shutdown requests from admins
+shutdownEvent.OnServerEvent:Connect(function(player, placeId, reason)
+	-- Verify the player is an admin
+	if not Config.IsAdmin(player) then
+		warn("Non-admin", player.Name, "attempted to shutdown server")
+		return
+	end
+	
+	-- Validate the place ID
+	local validPlace = false
+	for _, place in ipairs(Config.Places) do
+		if place.PlaceId == placeId then
+			validPlace = true
+			break
+		end
+	end
+	
+	if not validPlace then
+		warn("Invalid place ID for shutdown:", placeId)
+		return
+		end
+	
+	-- Send shutdown message via MessagingService
+	local topic = "ServerShutdown_" .. tostring(placeId)
+	local messageData = {
+		reason = reason or "Server shutdown by admin",
+		adminName = player.Name,
+		timestamp = os.time()
+	}
+	
+	local success, result = pcall(function()
+		MessagingService:PublishAsync(topic, messageData)
+	end)
+	
+	if success then
+		print("Shutdown command sent for place", placeId, "by", player.Name)
+	else
+		warn("Failed to send shutdown command:", result)
+	end
+end)
+
+-- Handle admin check requests
+checkAdminEvent.OnServerInvoke = function(player)
+	return Config.IsAdmin(player)
+end
+
+-- Handle join permission check requests from client
+-- serverType is required; placeId is optional — if provided, custom permission is checked first
+checkJoinPermissionFunc.OnServerInvoke = function(player, serverType, placeId)
+	if placeId then
+		local customPerm = getCustomPermissionForPlace(placeId)
+		if customPerm and customPerm.Mode then
+			return Config.CanJoinWithCustomPermission(player, customPerm, serverType)
+		end
+	end
+	return Config.CanJoinServerType(player, serverType)
+end
+
+-- Handle admin setting custom permission for a place
+setCustomPermissionEvent.OnServerEvent:Connect(function(player, placeId, permissionData)
+	if not Config.IsAdmin(player) then
+		warn("Non-admin", player.Name, "attempted to set custom permission")
+		return
+	end
+	
+	-- Validate the place ID exists in config
+	local validPlace = false
+	for _, place in ipairs(Config.Places) do
+		if place.PlaceId == placeId then
+			validPlace = true
+			break
+		end
+	end
+	if not validPlace then
+		warn("Invalid place ID for custom permission:", placeId)
+		return
+	end
+	
+	-- Validate permission data
+	if type(permissionData) ~= "table" then
+		warn("Invalid permission data from", player.Name)
+		return
+	end
+	
+	-- Inject the creator's UserId automatically
+	permissionData.CreatorUserId = player.UserId
+	
+	local success = setCustomPermissionForPlace(placeId, permissionData)
+	if success then
+		print("Custom permission set for place", placeId, "by", player.Name, "mode:", permissionData.Mode)
+	else
+		warn("Failed to save custom permission for place", placeId)
+	end
+end)
+
+-- Handle client requesting custom permission for a place
+getCustomPermissionFunc.OnServerInvoke = function(player, placeId)
+	return getCustomPermissionForPlace(placeId)
+end
+
+-- Handle get places requests with live player counts
+getPlacesEvent.OnServerInvoke = function(player, serverType)
+	local places = {}
+	local sourcePlaces = (serverType and serverType ~= "") and Config.GetPlacesByType(serverType) or Config.GetAllPlaces()
+	
+	for _, place in ipairs(sourcePlaces) do
+		local placeCopy = {}
+		for k, v in pairs(place) do
+			placeCopy[k] = v
+		end
+		
+		-- Fetch live player count from DataStore
+		local success, countData = pcall(function()
+			return playerCountStore:GetAsync("Place_" .. tostring(place.PlaceId))
+		end)
+		
+		if success and countData then
+			placeCopy.CurrentPlayers = countData.currentPlayers or 0
+		else
+			placeCopy.CurrentPlayers = 0
+		end
+		
+		-- Add join permission info for the client (custom permission overrides default)
+		local customPerm = getCustomPermissionForPlace(place.PlaceId)
+		local canJoin, reason = Config.CanJoinWithCustomPermission(player, customPerm, place.Type)
+		placeCopy.CanJoin = canJoin
+		placeCopy.JoinDenyReason = reason
+		placeCopy.CustomPermission = customPerm
+		
+		table.insert(places, placeCopy)
+	end
+	
+	return places
+end
+
+-- Update this server's player count periodically
+local function updatePlayerCount()
+	local placeId = game.PlaceId
+	local currentPlayers = #Players:GetPlayers()
+	
+	local success, result = pcall(function()
+		playerCountStore:SetAsync("Place_" .. tostring(placeId), {
+			currentPlayers = currentPlayers,
+			lastUpdated = os.time()
+		})
+	end)
+	
+	if not success then
+		warn("Failed to update player count:", result)
+	end
+end
+
+-- Update player count on player join/leave
+Players.PlayerAdded:Connect(function(player)
+	task.wait(1) -- Small delay to ensure player is fully loaded
+	updatePlayerCount()
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	task.wait(1) -- Small delay
+	updatePlayerCount()
+end)
+
+-- Periodic update every 30 seconds
+task.spawn(function()
+	while true do
+		updatePlayerCount()
+		task.wait(30)
+	end
+end)
+
+-- Initial update
+updatePlayerCount()
+
+print("Server Browser Server Script loaded successfully")
